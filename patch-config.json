@@ -10,5 +10,6 @@
     { "app_name": "fotmob", "source": "hoo" },
     { "app_name": "threads", "source": "rookie"},
     { "app_name": "telegram", "source": "paresh" },
+    { "app_name": "x", "source": "piko" },
   ]
 }
