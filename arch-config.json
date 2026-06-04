@@ -13,10 +13,5 @@
     "app_name": "instagram",
     "source": "piko",
     "arches": ["arm64-v8a"]
-  },
-  {
-    "app_name": "tiktok",
-    "source": "icysymmetra",
-    "arches": ["arm64-v8a"]
   }
 ]
