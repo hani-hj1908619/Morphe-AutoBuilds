@@ -6,8 +6,8 @@
     { "app_name": "reddit", "source": "morphe" },
     { "app_name": "instagram", "source": "piko" },
     { "app_name": "x", "source": "piko" },
-    { "app_name": "proton-vpn", "source": "hoo" },
-    { "app_name": "fotmob", "source": "hoo" },
+    { "app_name": "proton-vpn", "source": "Hoo" },
+    { "app_name": "fotmob", "source": "Hoo" },
     { "app_name": "threads", "source": "rookie"},
     { "app_name": "telegram", "source": "paresh" },
     { "app_name": "truecaller", "source": "paresh" }
