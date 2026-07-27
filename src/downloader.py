@@ -8,7 +8,8 @@ from src import (
     session,
     uptodown,
     aptoide,
-    apkmirror
+    apkmirror,
+    github
 )
 
 def download_resource(url: str, name: str = None) -> Path:
@@ -66,7 +67,7 @@ def download_required(source: str) -> tuple[list[Path], str]:
             # Keep the existing Morphe-specific asset filtering.
             if "morphe-patches" in entry_name or "morphe-cli" in entry_name:
                 if asset_name.endswith(".mpp") or (
-                    "morphe-cli" in asset_name and asset_name.endswith(".jar")
+                    asset_name.lower().endswith(".jar")
                 ):
                     downloaded_files.append(download_resource(asset_url))
             else:
@@ -192,6 +193,15 @@ def download_apkmirror(
     override_version: str = None,
 ) -> tuple[Path | None, str | None, list[str]]:
     return download_platform(app_name, "apkmirror", cli, patches, arch, override_version)
+
+def download_github(
+    app_name: str,
+    cli: str,
+    patches: str,
+    arch: str = None,
+    override_version: str = None,
+) -> tuple[Path | None, str | None, list[str]]:
+    return download_platform(app_name, "github", cli, patches, arch, override_version)
 
 def download_apkpure(
     app_name: str,
