@@ -4,6 +4,7 @@ import re
 import shutil
 import time
 import logging
+import zipfile
 from typing import List, Optional
 from github.GithubException import BadCredentialsException
 from src import gh
@@ -60,8 +61,10 @@ def find_file(files: list[Path], prefix: str = None, suffix: str = None, contain
         if prefix and not file.name.startswith(prefix):
             matches = False
             
-        if suffix and not file.name.endswith(suffix):
-            matches = False
+        if suffix:
+            suff_tuple = tuple(suffix) if isinstance(suffix, (list, tuple)) else suffix
+            if not file.name.endswith(suff_tuple):
+                matches = False
             
         if contains and contains.lower() not in file.name.lower():
             matches = False
@@ -194,7 +197,18 @@ def get_highest_version(versions: list[str]) -> str | None:
             highest_version = v
     return highest_version
 
-def get_supported_versions(package_name: str, cli: str, patches: str) -> list[str]:
+def get_supported_versions(package_name: str, cli: str, patches: str) -> Optional[list[str]]:
+    """Return the app versions the patch bundle declares compatibility with.
+
+    Returns:
+        list[str]: specific compatible versions, highest first. The caller must
+            build one of these and must NOT fall back to the store's latest.
+        []: the CLI query succeeded but no specific versions were declared
+            (patches are version-agnostic); building latest is safe.
+        None: the CLI query itself failed, so patch compatibility is unknown.
+            The caller must NOT build; guessing latest risks shipping a build
+            with silently skipped patches.
+    """
     # Morphe CLI and ReVanced CLI have different list-versions syntax
     cli_name = Path(cli).name.lower()
     is_morphe_cli = 'morphe' in cli_name
@@ -235,7 +249,7 @@ def get_supported_versions(package_name: str, cli: str, patches: str) -> list[st
 
     if not output:
         logging.warning("No output returned from list-versions command")
-        return []
+        return None
 
     lines = output.splitlines()
     logging.info(f"CLI raw output lines: {lines}")
@@ -244,7 +258,7 @@ def get_supported_versions(package_name: str, cli: str, patches: str) -> list[st
     first_line = lines[0].strip().lower()
     if 'usage:' in first_line or 'unmatched argument' in first_line or 'error' in first_line:
         logging.warning(f"CLI returned error/usage output, cannot determine version")
-        return []
+        return None
 
     if len(lines) <= 2:
         logging.warning("Output has no version lines")
@@ -302,7 +316,10 @@ def get_supported_versions(package_name: str, cli: str, patches: str) -> list[st
 
 
 def get_supported_version(package_name: str, cli: str, patches: str) -> Optional[str]:
-    """Backwards compatible helper: returns the highest compatible version, if any."""
+    """Backwards compatible helper: returns the highest compatible version, if any.
+
+    Returns None when the CLI query fails OR when patches are version-agnostic.
+    """
     versions = get_supported_versions(package_name, cli, patches)
     return versions[0] if versions else None
 
@@ -471,7 +488,7 @@ def detect_github_release(user: str, repo: str, tag: str) -> dict:
     for attempt in range(max_retries):
         try:
             # Prefer 'gh' CLI as it handles tokens more robustly in Actions environment
-            if attempt < 2:
+            if attempt < 2 and shutil.which("gh"):
                 logging.info(f"Fetching release {tag} for {user}/{repo} (attempt {attempt + 1})...")
                 
                 if tag == "latest":
@@ -503,13 +520,12 @@ def detect_github_release(user: str, repo: str, tag: str) -> dict:
                     data = gh_api_request(f"repos/{user}/{repo}/releases/tags/{tag}")
                     return data
             else:
-                # Last ditch effort with PyGithub if gh CLI fails
+                # Fallback to PyGithub
                 logging.warning(f"Falling back to PyGithub for {user}/{repo}...")
                 repo_obj = gh.get_repo(f"{user}/{repo}")
                 if tag == "latest":
                     release = repo_obj.get_latest_release()
                     return release.raw_data
-                # ... other cases omitted for brevity as gh CLI is preferred ...
                 return repo_obj.get_release(tag).raw_data
                     
         except Exception as e:
@@ -543,3 +559,176 @@ def detect_source_type(cli_file: Path, patches_file: Path) -> str:
     elif cli_file and "revanced" in cli_file.name.lower() and patches_file and patches_file.suffix in [".jar", ".rvp"]:
         return "revanced"
     return "unknown"
+
+
+def strip_zip_entries(zip_path: Path, patterns: list[str]) -> None:
+    """Strip matching file patterns from a ZIP archive in a cross-platform way."""
+    if not zip_path or not zip_path.exists():
+        return
+
+    if shutil.which("zip"):
+        try:
+            run_process(["zip", "--delete", str(zip_path)] + patterns, silent=True, check=False)
+            return
+        except Exception:
+            pass
+
+    # Pure Python fallback using zipfile
+    temp_zip = zip_path.with_suffix(".tmp.zip")
+    try:
+        import fnmatch
+        modified = False
+        with zipfile.ZipFile(zip_path, 'r') as zin:
+            with zipfile.ZipFile(temp_zip, 'w', compression=zin.compression) as zout:
+                for item in zin.infolist():
+                    if any(fnmatch.fnmatch(item.filename, p) for p in patterns):
+                        modified = True
+                        continue
+                    zout.writestr(item, zin.read(item.filename))
+        if modified:
+            zip_path.unlink()
+            temp_zip.rename(zip_path)
+        else:
+            temp_zip.unlink(missing_ok=True)
+    except Exception as e:
+        logging.debug(f"Failed to strip zip entries: {e}")
+        if temp_zip.exists():
+            temp_zip.unlink(missing_ok=True)
+
+
+def check_apk_integrity(apk_path: Path) -> bool:
+    """Validate that APK is a valid uncorrupted zip archive."""
+    if not apk_path or not apk_path.exists() or apk_path.stat().st_size == 0:
+        return False
+    try:
+        if not zipfile.is_zipfile(apk_path):
+            return False
+        with zipfile.ZipFile(apk_path, 'r') as z:
+            bad_file = z.testzip()
+            if bad_file is not None:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+BUNDLE_SUFFIXES = (".xapk", ".apks", ".apkm")
+
+
+def _is_bundle(path: Path) -> bool:
+    """Return True if the file is an APK bundle (XAPK/APKS/APKM or a zip
+    containing APK files). Bundle containers are not Android-signed; the
+    APK inside is."""
+    if not path or not path.exists():
+        return False
+    if path.suffix.lower() in BUNDLE_SUFFIXES:
+        return True
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path, "r") as z:
+                return any(n.lower().endswith(".apk") for n in z.namelist())
+    except Exception:
+        pass
+    return False
+
+
+def ensure_usable_apk(apk_path: Path, app_name: str, version: str) -> Path | None:
+    """Return ``apk_path`` if it is a usable download.
+
+    Follows the pattern of proven auto-builders (e.g. nikhilbadyal/docker-py-revanced):
+    only verify the file is a valid zip archive. Do NOT check Android signatures
+    here: bundle containers (XAPK/APKS/APKM) are not signed, and the patcher
+    itself reports truly unusable input. Signature pre-checks caused good
+    downloads to be discarded.
+
+    Bundle files pass through for the downstream APKEditor merge; standalone
+    APKs pass through for direct patching.
+    """
+    if not apk_path or not apk_path.exists() or apk_path.stat().st_size == 0:
+        logging.warning(f"Download missing or empty for {app_name}; discarding")
+        return None
+
+    if not check_apk_integrity(apk_path):
+        logging.warning(f"Download {apk_path.name} is not a valid zip; discarding")
+        apk_path.unlink(missing_ok=True)
+        return None
+
+    if _is_bundle(apk_path):
+        logging.info(f"Bundle {apk_path.name} passes zip integrity; leaving for APKEditor merge")
+    else:
+        logging.info(f"APK {apk_path.name} passes zip integrity check")
+
+    return apk_path
+
+
+KNOWN_ABIS = {"arm64-v8a", "armeabi-v7a", "armeabi", "x86", "x86_64"}
+_SPLIT_ABI_RE = re.compile(r"config\.([a-z0-9_]+)\.apk$", re.IGNORECASE)
+
+
+def _normalize_abi(token: str) -> str:
+    return token.strip().lower().replace("_", "-")
+
+
+def download_abis(path: Path) -> set[str]:
+    """Return the native ABIs a downloaded APK or bundle provably provides.
+
+    Plain APK: its ``lib/<abi>/`` entries. Bundle (XAPK/APKS/APKM): the
+    ``config.<abi>`` split APK names (which is exactly what the APKEditor
+    merge will carry into the merged APK) plus any ``lib/<abi>/`` entries.
+
+    An empty set means "no evidence": the app may have no native code at
+    all, or its libraries sit inside a bundle's base APK where this listing
+    cannot see them. Callers must only reject a download on positive
+    evidence (a non-empty set missing a required ABI), never on an empty
+    set.
+    """
+    abis: set[str] = set()
+    if not path or not path.exists() or not zipfile.is_zipfile(path):
+        return abis
+    try:
+        with zipfile.ZipFile(path, "r") as z:
+            for name in z.namelist():
+                parts = name.split("/")
+                if len(parts) >= 2 and parts[0] == "lib":
+                    abi = _normalize_abi(parts[1])
+                    if abi in KNOWN_ABIS:
+                        abis.add(abi)
+                m = _SPLIT_ABI_RE.search(name)
+                if m:
+                    abi = _normalize_abi(m.group(1))
+                    if abi in KNOWN_ABIS:
+                        abis.add(abi)
+    except Exception:
+        pass
+    return abis
+
+
+def combine_bundles(paths: list[Path], out_path: Path) -> Path | None:
+    """Combine several bundle files into one bundle holding the union of
+    their entries (first occurrence wins on duplicate names).
+
+    Mirrors serve per-device variants of the same app version as separate
+    XAPKs whose split sets differ (one carries the arm64-v8a config split,
+    another the armeabi-v7a split, a third extra languages). Merging any
+    single variant produces an APK that lacks the other variants' splits;
+    the union is what a full bundle would have contained.
+    """
+    try:
+        seen: set[str] = set()
+        with zipfile.ZipFile(out_path, "w") as zout:
+            for p in paths:
+                with zipfile.ZipFile(p, "r") as zin:
+                    for item in zin.infolist():
+                        if item.is_dir() or item.filename in seen:
+                            continue
+                        seen.add(item.filename)
+                        zout.writestr(item, zin.read(item.filename))
+        logging.info(
+            f"Combined {len(paths)} bundle variants into {out_path.name} "
+            f"({len(seen)} unique entries)"
+        )
+        return out_path
+    except Exception as e:
+        logging.warning(f"Failed to combine bundle variants: {e}")
+        out_path.unlink(missing_ok=True)
+        return None
